@@ -1,0 +1,14 @@
+{
+  "name": "n8n-workflows-credentials-export",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Scan n8n workflow JSON exports for credential references and hardcoded secrets",
+  "scripts": {
+    "extract:n8n-creds": "node scripts/extract-n8n-credentials.js"
+  },
+  "dependencies": {
+    "csv-stringify": "^6.5.2",
+    "dotenv": "^16.4.7",
+    "fast-glob": "^3.3.3"
+  }
+}

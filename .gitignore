@@ -1,0 +1,22 @@
+# Local workflow exports (do not commit or push)
+marcuslodge-workflows/
+
+# Dependencies
+node_modules/
+
+# Local secrets and paths — copy from .env.example instead
+.env
+.env.local
+.env.*.local
+
+# Tool output (often contains credential material)
+*.csv
+
+# Logs and debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
