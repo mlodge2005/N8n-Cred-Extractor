@@ -1,6 +1,6 @@
 /**
- * Recursively scans n8n workflow JSON exports for credential references
- * and hardcoded secret-like values. Writes CSV; does not print secrets.
+ * Strict, node-aware n8n workflow credential / secret export.
+ * Does not print secret values to the terminal.
  */
 
 require('dotenv').config();
@@ -24,62 +24,109 @@ const CSV_HEADERS = [
   'Notes',
 ];
 
-/** Keys / path segments that usually hold non-secret prose */
-const SKIP_VALUE_SCAN_KEYS = new Set([
-  'jsCode',
-  'systemMessage',
-  'systemmessage',
-  'text',
-  'message',
-  'messages',
-  'prompt',
-  'description',
-  'content',
-  'html',
-  'markdown',
+const REVIEW_HEADERS = [...CSV_HEADERS, 'Reason'];
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const HTTP_NODE = 'n8n-nodes-base.httpRequest';
+const WEBHOOK_NODE = 'n8n-nodes-base.webhook';
+const SET_NODE = 'n8n-nodes-base.set';
+const CODE_NODE = 'n8n-nodes-base.code';
+
+const BLOCKED_BROAD_SCAN_TYPES = new Set([
+  'n8n-nodes-base.if',
+  'n8n-nodes-base.switch',
+  'n8n-nodes-base.googleSheets',
+  'n8n-nodes-base.gmail',
+  'n8n-nodes-base.telegram',
+  'n8n-nodes-base.filter',
+  'n8n-nodes-base.merge',
+  'n8n-nodes-base.itemLists',
 ]);
 
-const SECRET_KEY_SUBSTRINGS = [
-  'secret',
-  'token',
+const INTERNAL_ID_KEYS = new Set([
+  'id',
+  'nodeid',
+  'webhookid',
+  'conditionid',
+  'paireditem',
+  'cachedresultname',
+]);
+
+const QUERY_SECRET_NAMES = new Set([
   'api_key',
   'apikey',
-  'password',
-  'authorization',
-  'bearer',
-  'client_secret',
+  'token',
   'access_token',
   'refresh_token',
-  'private_key',
-  'webhook_secret',
-  'download_secret',
-  'intake_secret',
-  'delivery_secret',
+  'client_secret',
+  'password',
+  'secret',
+  'bearer',
+]);
+
+const HTTP_AUTH_HEADER_NAMES = new Set([
+  'authorization',
   'x-api-key',
-  'x_api_key',
+  'x-apikey',
+  'api-key',
+  'apikey',
+  'token',
+]);
+
+const SET_NAME_SECRET_RE =
+  /secret|token|api[\s_]*key|apikey|password|bearer|authorization|client_secret|access_token|refresh_token|webhook_secret|download_secret|intake_secret|delivery_secret/i;
+
+const CODE_SECRET_PATTERNS = [
+  { re: /Authorization\s*:\s*Bearer\s+([^\s'"`]+)/gi, label: 'Authorization Bearer' },
+  { re: /Authorization\s*:\s*Token\s+([^\s'"`]+)/gi, label: 'Authorization Token' },
+  { re: /apiKey\s*=\s*["']([^"']+)["']/gi, label: 'apiKey' },
+  { re: /api_key\s*=\s*["']([^"']+)["']/gi, label: 'api_key' },
+  { re: /password\s*=\s*["']([^"']+)["']/gi, label: 'password' },
+  { re: /token\s*=\s*["']([^"']+)["']/gi, label: 'token' },
+  { re: /client_secret\s*=\s*["']([^"']+)["']/gi, label: 'client_secret' },
 ];
 
-function normalizeKeySegment(key) {
-  return String(key).toLowerCase().replace(/[\s-]/g, '_');
+function normalizeMode() {
+  const m = (process.env.EXTRACTION_MODE || 'strict').toLowerCase().trim();
+  return m === 'loose' ? 'loose' : 'strict';
 }
 
-function isSecretLikeKey(key) {
-  if (!key || typeof key !== 'string') return false;
-  const nk = normalizeKeySegment(key);
-  for (const s of SECRET_KEY_SUBSTRINGS) {
-    if (nk.includes(s.replace(/-/g, '_'))) return true;
+function isUuid(value) {
+  if (typeof value !== 'string') return false;
+  return UUID_RE.test(value.trim());
+}
+
+function isN8nExpression(value) {
+  if (typeof value !== 'string') return false;
+  const t = value.trim();
+  return t.startsWith('={{') && t.endsWith('}}');
+}
+
+function isLikelyPromptText(value) {
+  if (typeof value !== 'string') return false;
+  const t = value.trim();
+  if (t.length > 6000) return true;
+  const low = t.slice(0, 800).toLowerCase();
+  if (
+    /\byou are (a|an)\b/.test(low) &&
+    t.length > 400
+  ) {
+    return true;
   }
-  if (nk === 'auth' || nk.endsWith('_auth') || nk.startsWith('auth_')) return true;
-  if (nk.includes('authorization')) return true;
-  if (nk.includes('pass') && (nk.includes('password') || nk.includes('passphrase') || nk.includes('passwd'))) return true;
-  if (nk === 'pass' || nk.endsWith('_pass')) return true;
+  if (/\bjson schema\b/i.test(t) && t.length > 500) return true;
+  if (/\btranscript\b/i.test(low) && t.length > 1200) return true;
   return false;
 }
 
-function isBareN8nExpression(str) {
-  if (typeof str !== 'string') return false;
-  const t = str.trim();
-  return t.startsWith('={{') && t.endsWith('}}');
+function isSecretKeyName(key) {
+  if (!key || typeof key !== 'string') return false;
+  const nk = key.toLowerCase().replace(/[\s-]/g, '_');
+  if (SET_NAME_SECRET_RE.test(key)) return true;
+  if (QUERY_SECRET_NAMES.has(nk)) return true;
+  if (nk === 'key' || nk.endsWith('_key')) return true;
+  return false;
 }
 
 function looksLikeEmail(s) {
@@ -98,7 +145,6 @@ function looksLikeHttpUrl(s) {
   const t = s.trim();
   if (!/^https?:\/\//i.test(t)) return false;
   try {
-    // eslint-disable-next-line no-new
     new URL(t);
     return true;
   } catch {
@@ -106,145 +152,90 @@ function looksLikeHttpUrl(s) {
   }
 }
 
-function isHighEntropyToken(str) {
-  if (typeof str !== 'string') return false;
-  const t = str.trim();
-  if (t.length < 24 || t.length > 4096) return false;
-  if (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) return true;
-  if (/^sk-[a-zA-Z0-9]{10,}/.test(t)) return true;
-  if (/^sk-ant-api/.test(t)) return true;
-  if (/^xox[baprs]-/.test(t)) return true;
-  if (/^github_pat_/.test(t)) return true;
-  if (/^glpat-/.test(t)) return true;
-  if (/^rgsk_/.test(t)) return true;
-  const alnum = (t.match(/[a-zA-Z0-9]/g) || []).length;
-  if (alnum / t.length < 0.72) return false;
-  const unique = new Set(t).size;
-  if (unique < 8 && t.length > 40) return false;
-  return /^[a-zA-Z0-9+/=_-]+$/.test(t) && t.length >= 32;
-}
-
-function looksLikeBearerOrTokenHeader(str) {
-  if (typeof str !== 'string') return false;
-  const t = str.trim();
-  return /^Bearer\s+\S+/i.test(t) || /^Token\s+\S+/i.test(t);
-}
-
-function isUsernameLikeKey(key) {
-  if (!key || typeof key !== 'string') return false;
-  const nk = key.toLowerCase();
-  return nk === 'username' || nk === 'user' || nk === 'login' || nk.endsWith('username');
-}
-
-function shouldSkipValueScanByPath(pathStr, lastKey) {
-  const pl = pathStr.toLowerCase();
-  for (const k of SKIP_VALUE_SCAN_KEYS) {
-    if (pl.includes(`.${k}.`) || pl.endsWith(`.${k}`) || pl.includes(`["${k}"]`)) return true;
-  }
-  if (lastKey && SKIP_VALUE_SCAN_KEYS.has(String(lastKey).toLowerCase())) return true;
+function isHttpAuthHeaderName(name) {
+  if (!name || typeof name !== 'string') return false;
+  const n = name.trim().toLowerCase();
+  if (HTTP_AUTH_HEADER_NAMES.has(n)) return true;
+  if (n === 'bearer' || n.startsWith('x-')) return /api|auth|key|token/.test(n);
   return false;
 }
 
-/** IDs / list keys that often hold long non-secret resource identifiers */
-function isLikelyNonSecretResourcePath(pathStr, lastKeyClean) {
-  const pl = pathStr.toLowerCase();
-  if (lastKeyClean !== 'value') return false;
-  if (
-    pl.includes('.documentid.') ||
-    pl.includes('.sheetname.') ||
-    pl.includes('.sheetid.') ||
-    pl.includes('.spreadsheetid.') ||
-    pl.includes('.driveid.') ||
-    pl.includes('.folderid.') ||
-    pl.includes('.channelid.') ||
-    pl.includes('.videoid.')
-  ) {
-    return true;
-  }
+function isInternalConfigIdField(fieldName, fieldPath) {
+  const fn = (fieldName || '').toString().toLowerCase();
+  const fp = (fieldPath || '').toLowerCase();
+  if (INTERNAL_ID_KEYS.has(fn)) return true;
+  if (fn === 'webhookid' || fn === 'nodeid') return true;
+  if (fp.endsWith('.id') || fp.endsWith('].id')) return true;
+  if (/\.conditions\.conditions\[\d+\]\.id$/i.test(fp)) return true;
   return false;
 }
 
-function classifyHardcodedNote({
-  fieldPath,
-  lastKey,
-  valueStr,
-  nodeType,
-  isSetAssignmentValue,
-}) {
-  const pathL = fieldPath.toLowerCase();
-  const keyL = (lastKey || '').toLowerCase();
-
-  if (isSetAssignmentValue) return 'set node secret value';
-
-  if (
-    looksLikeBearerOrTokenHeader(valueStr) ||
-    keyL === 'authorization' ||
-    pathL.includes('authorization') ||
-    (keyL.includes('auth') && pathL.includes('header'))
-  ) {
-    return 'hardcoded Authorization header';
-  }
-
-  if (pathL.includes('webhook_secret') || keyL.includes('webhook_secret')) {
-    return 'hardcoded webhook secret';
-  }
-
-  if (
-    keyL.includes('apikey') ||
-    keyL.includes('api_key') ||
-    pathL.includes('apikey') ||
-    pathL.includes('x-api-key') ||
-    pathL.includes('x_api_key')
-  ) {
-    return 'hardcoded API key';
-  }
-
-  if (nodeType === 'n8n-nodes-base.httpRequest' && pathL.includes('header') && isSecretLikeKey(lastKey)) {
-    return 'hardcoded Authorization header';
-  }
-
-  return 'hardcoded password/token';
+function nodeNameSuggestsSecrets(node) {
+  const n = (node.name || '').toLowerCase();
+  return /secret|auth|token|api key|credential/.test(n);
 }
 
-function serviceFromNodeType(nodeType) {
-  if (!nodeType || typeof nodeType !== 'string') return 'unknown';
-  const m = nodeType.match(/n8n-nodes-base\.(.+)/);
-  return m ? m[1] : nodeType;
+function isLangchainOrOutputParser(type) {
+  if (!type || typeof type !== 'string') return false;
+  if (type.includes('langchain') || type.includes('LangChain')) return true;
+  if (/outputparser|output_parser|chainlLm|agent/i.test(type)) return true;
+  return false;
 }
 
-function buildMiscPieces({ nodeName, nodeType, workflowName, filePath, fieldPath, credId }) {
-  const base = [
+function isBlockedBroadScanType(type) {
+  if (!type) return true;
+  if (BLOCKED_BROAD_SCAN_TYPES.has(type)) return true;
+  if (isLangchainOrOutputParser(type)) return true;
+  return false;
+}
+
+/** Strict: only these (+ name-matched) participate in hardcoded extraction */
+function isStrictHardcodedTarget(node) {
+  const t = node.type || '';
+  if (t === HTTP_NODE || t === WEBHOOK_NODE || t === SET_NODE || t === CODE_NODE) return true;
+  if (nodeNameSuggestsSecrets(node)) return true;
+  return false;
+}
+
+function setAssignmentNameIndicatesSecret(name) {
+  if (!name || typeof name !== 'string') return false;
+  return SET_NAME_SECRET_RE.test(name);
+}
+
+function classifyCandidate(value, fieldName, fieldPath, notesDefault) {
+  if (value === null || value === undefined) return { ok: false, reason: 'empty' };
+  if (typeof value === 'boolean') return { ok: false, reason: 'filtered_boolean' };
+  if (typeof value === 'number') return { ok: false, reason: 'filtered_number' };
+  if (typeof value !== 'string') return { ok: false, reason: 'unsupported_type' };
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: false, reason: 'empty' };
+  if (isN8nExpression(trimmed)) return { ok: false, reason: 'filtered_n8n_expression' };
+  if (isUuid(trimmed)) return { ok: false, reason: 'filtered_uuid' };
+  if (isInternalConfigIdField(fieldName, fieldPath)) return { ok: false, reason: 'internal_config_id' };
+  if (isLikelyPromptText(trimmed)) return { ok: false, reason: 'prompt_text_or_schema' };
+  if (trimmed.length < 6) return { ok: false, reason: 'low_confidence_set_node_value' };
+  return { ok: true, value: trimmed, reason: null, notes: notesDefault };
+}
+
+function buildMisc({ nodeName, nodeType, workflowName, filePath, fieldPath, credId, duplicateCount }) {
+  const parts = [
     `node="${nodeName}"`,
     `type="${nodeType}"`,
     `workflow="${workflowName}"`,
     `file="${path.basename(filePath)}"`,
     `path=${fieldPath}`,
   ];
-  if (credId !== undefined && credId !== null && credId !== '') {
-    base.push(`credId=${credId}`);
-  }
-  return base.join('; ');
+  if (credId) parts.push(`credId=${credId}`);
+  if (duplicateCount && duplicateCount > 1) parts.push(`duplicate_count=${duplicateCount}`);
+  return parts.join('; ');
 }
 
-function dedupKey(filePath, workflowName, nodeId, fieldPath, passwordVal, credAccount) {
-  return [
-    path.normalize(filePath),
-    workflowName || '',
-    nodeId || '',
-    fieldPath || '',
-    passwordVal || '',
-    credAccount || '',
-  ].join('\t');
+function credDedupKey(serviceKey, account, credId) {
+  return `type:cred-ref|${serviceKey}|${account}|${credId}`;
 }
 
-/** Join path parts: assignments.assignments[2].value */
-function pathPartsToFieldPath(parts) {
-  let s = '';
-  for (const p of parts) {
-    if (p.startsWith('[')) s += p;
-    else s += (s ? '.' : '') + p;
-  }
-  return s;
+function hardcodedDedupKey(service, password, notes) {
+  return `type:hardcoded|${service}|${password}|${notes}`;
 }
 
 function extractWorkflowPayload(data) {
@@ -264,137 +255,465 @@ function extractWorkflowPayload(data) {
   return null;
 }
 
-function isSetNodeAssignmentValue(pathParts) {
-  if (pathParts.length < 4) return false;
-  const last = pathParts[pathParts.length - 1];
-  const idx = pathParts[pathParts.length - 2];
-  const a1 = pathParts[pathParts.length - 3];
-  const a0 = pathParts[pathParts.length - 4];
-  return last === 'value' && /^\[\d+\]$/.test(idx) && a1 === 'assignments' && a0 === 'assignments';
-}
+/** --- HTTP Request (strict paths only) --- */
+function extractHttpRequestSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  const p = node.parameters || {};
+  const nodeName = node.name || '';
+  const nodeType = node.type || '';
 
-function walkParametersForSecrets(
-  obj,
-  pathParts,
-  node,
-  workflowName,
-  filePath,
-  onFinding,
-  ctx,
-  parentObj,
-) {
-  if (obj === null || obj === undefined) return;
-
-  const fieldTail = pathPartsToFieldPath(pathParts);
-  const pathStr = fieldTail ? `parameters.${fieldTail}` : 'parameters';
-
-  if (typeof obj === 'string') {
-    const lastKey = pathParts[pathParts.length - 1] || '';
-    const lastKeyClean = String(lastKey).replace(/\[\d+\]$/, '');
-    const headerLabel =
-      lastKeyClean === 'value' &&
-      pathStr.toLowerCase().includes('header') &&
-      parentObj &&
-      typeof parentObj === 'object' &&
-      !Array.isArray(parentObj) &&
-      parentObj.name != null &&
-      parentObj.type === undefined
-        ? String(parentObj.name)
-        : null;
-    const effectiveKeyForClassify = headerLabel || lastKeyClean;
-    if (shouldSkipValueScanByPath(pathStr, lastKeyClean)) return;
-
-    if (isBareN8nExpression(obj)) return;
-    const trimmed = obj.trim();
-    if (!trimmed) return;
-
-    const keyFromPath = typeof effectiveKeyForClassify === 'string' ? effectiveKeyForClassify : '';
-    const secretKey = isSecretLikeKey(keyFromPath) || (headerLabel && looksLikeBearerOrTokenHeader(trimmed));
-    const longPlain = trimmed.length > 900 && !secretKey;
-    if (longPlain) return;
-
-    let emit = false;
-    if (secretKey) emit = true;
-    else if (looksLikeBearerOrTokenHeader(trimmed)) emit = true;
-    else if (isHighEntropyToken(trimmed)) emit = true;
-
-    if (!emit) return;
-
-    if (
-      !secretKey &&
-      !looksLikeBearerOrTokenHeader(trimmed) &&
-      isLikelyNonSecretResourcePath(pathStr, lastKeyClean)
-    ) {
-      return;
-    }
-
-    const isSetAssignmentValue =
-      node.type === 'n8n-nodes-base.set' && isSetNodeAssignmentValue(pathParts);
-
-    const note = classifyHardcodedNote({
-      fieldPath: pathStr,
-      lastKey: keyFromPath,
-      valueStr: trimmed,
-      nodeType: node.type,
-      isSetAssignmentValue,
+  const pushClean = (service, password, fieldPath) => {
+    stats.hardcodedRaw++;
+    const notes = 'hardcoded HTTP auth/header secret';
+    const key = hardcodedDedupKey(service, password, notes);
+    const misc = buildMisc({
+      nodeName,
+      nodeType,
+      workflowName,
+      filePath,
+      fieldPath,
+      credId: '',
+      duplicateCount: 1,
     });
-
-    const urlCol = looksLikeHttpUrl(trimmed) ? trimmed : '';
-    const emailCol = looksLikeEmail(trimmed) ? trimmed : '';
-    const phoneCol = looksLikePhone(trimmed) ? trimmed : '';
-    const userCol =
-      isUsernameLikeKey(effectiveKeyForClassify) && !looksLikeEmail(trimmed) ? trimmed : '';
-
-    onFinding({
+    const row = {
       Owner: OWNER,
-      Service: serviceFromNodeType(node.type),
+      Service: service || 'httpRequest',
       Account: '',
-      URL: urlCol,
-      Username: userCol,
-      Email: emailCol,
-      Phone: phoneCol,
-      Password: trimmed,
-      Miscellaneous: buildMiscPieces({
-        nodeName: node.name,
-        nodeType: node.type,
-        workflowName,
-        filePath,
-        fieldPath: headerLabel ? `${pathStr} (header name: ${headerLabel})` : pathStr,
-      }),
-      Notes: note,
-      _dedupAccount: '',
-      _fieldPath: headerLabel ? `${pathStr}:${headerLabel}` : pathStr,
-    });
-    return;
-  }
+      URL: looksLikeHttpUrl(password) ? password : '',
+      Username: '',
+      Email: looksLikeEmail(password) ? password : '',
+      Phone: looksLikePhone(password) ? password : '',
+      Password: password,
+      Miscellaneous: misc,
+      Notes: notes,
+    };
+    mergeHardcodedRow(cleanAgg, key, row);
+  };
 
-  if (typeof obj === 'number') {
-    const lastSeg = pathParts[pathParts.length - 1] || '';
-    const lastKeyClean = String(lastSeg).replace(/\[\d+\]$/, '');
-    if (!isSecretLikeKey(lastKeyClean)) return;
-    const s = String(obj);
-    if (s.length < 8) return;
-    const pathStrNum = pathParts.length ? `parameters.${pathParts.join('.')}` : 'parameters';
-    onFinding({
+  const pushReview = (reason, service, password, fieldPath) => {
+    const row = {
       Owner: OWNER,
-      Service: serviceFromNodeType(node.type),
+      Service: service || 'httpRequest',
       Account: '',
       URL: '',
       Username: '',
       Email: '',
       Phone: '',
-      Password: s,
-      Miscellaneous: buildMiscPieces({
-        nodeName: node.name,
-        nodeType: node.type,
+      Password: password,
+      Miscellaneous: buildMisc({
+        nodeName,
+        nodeType,
         workflowName,
         filePath,
-        fieldPath: pathStrNum,
+        fieldPath,
+        credId: '',
+        duplicateCount: 1,
       }),
-      Notes: 'hardcoded password/token',
-      _dedupAccount: '',
-      _fieldPath: pathStrNum,
+      Notes: 'hardcoded HTTP auth/header secret',
+      Reason: reason,
+    };
+    reviewAgg.push(row);
+  };
+
+  const hp = p.headerParameters;
+  if (hp && Array.isArray(hp.parameters)) {
+    for (const row of hp.parameters) {
+      const hname = (row.name || '').trim();
+      const val = row.value;
+      if (typeof val !== 'string') continue;
+      const fp = `parameters.headerParameters.parameters[] (header: ${hname})`;
+      if (!isHttpAuthHeaderName(hname) && !/^Bearer\s+/i.test(val.trim()) && !/^Token\s+/i.test(val.trim())) {
+        continue;
+      }
+      const c = classifyCandidate(val, hname, fp, '');
+      if (c.ok) pushClean(hname || 'header', c.value, fp);
+      else if (c.reason !== 'empty') pushReview(c.reason, hname, val.slice(0, 200), fp);
+    }
+  }
+
+  if (typeof p.jsonHeaders === 'string' && p.jsonHeaders.trim() && !isN8nExpression(p.jsonHeaders)) {
+    try {
+      const j = JSON.parse(p.jsonHeaders);
+      if (j && typeof j === 'object') {
+        for (const [k, v] of Object.entries(j)) {
+          if (typeof v !== 'string') continue;
+          if (!isSecretKeyName(k) && !isHttpAuthHeaderName(k)) continue;
+          const fp = `parameters.jsonHeaders.${k}`;
+          const c = classifyCandidate(v, k, fp, '');
+          if (c.ok) pushClean(k, c.value, fp);
+          else if (c.reason !== 'empty') pushReview(c.reason, k, String(v).slice(0, 200), fp);
+        }
+      }
+    } catch {
+      /* not JSON */
+    }
+  }
+
+  const qp = p.queryParameters;
+  if (qp && Array.isArray(qp.parameters)) {
+    for (const row of qp.parameters) {
+      const qn = (row.name || '').trim().toLowerCase().replace(/[\s-]/g, '_');
+      const val = row.value;
+      if (typeof val !== 'string') continue;
+      const origName = (row.name || '').trim();
+      const fp = `parameters.queryParameters.parameters[] (param: ${origName})`;
+      const nameMatch =
+        QUERY_SECRET_NAMES.has(qn) ||
+        (qn === 'key' && val.trim().length >= 24);
+      if (!nameMatch) continue;
+      const c = classifyCandidate(val, origName, fp, '');
+      if (c.ok) pushClean(origName || 'query', c.value, fp);
+      else if (c.reason !== 'empty') pushReview(c.reason, origName, val.slice(0, 200), fp);
+    }
+  }
+
+  const bodyCandidates = [];
+  if (typeof p.jsonBody === 'string' && p.jsonBody.trim() && !isN8nExpression(p.jsonBody)) {
+    try {
+      const j = JSON.parse(p.jsonBody);
+      if (j && typeof j === 'object') collectSecretLikeJsonKeys(j, '', bodyCandidates);
+    } catch {
+      /* ignore */
+    }
+  }
+  if (p.bodyParameters && Array.isArray(p.bodyParameters.parameters)) {
+    for (const row of p.bodyParameters.parameters) {
+      const bn = row.name || '';
+      const val = row.value;
+      if (typeof val === 'string' && isSecretKeyName(bn)) {
+        bodyCandidates.push({ key: bn, val, fp: `parameters.bodyParameters.parameters[] (${bn})` });
+      }
+    }
+  }
+  for (const { key, val, fp } of bodyCandidates) {
+    const c = classifyCandidate(val, key, fp, '');
+    if (c.ok) pushClean(key, c.value, fp);
+    else if (c.reason !== 'empty') pushReview(c.reason, key, String(val).slice(0, 200), fp);
+  }
+}
+
+function collectSecretLikeJsonKeys(obj, prefix, out) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (typeof v === 'string' && isSecretKeyName(k)) {
+      out.push({ key: k, val: v, fp: `parameters.jsonBody.${path}` });
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      collectSecretLikeJsonKeys(v, path, out);
+    }
+  }
+}
+
+/** --- Webhook: header auth blocks only --- */
+function extractWebhookSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  const p = node.parameters || {};
+  const nodeName = node.name || '';
+  const nodeType = node.type || '';
+
+  const authentication = p.authentication;
+  if (!authentication || typeof authentication !== 'object') return;
+
+  const pushClean = (service, password, fieldPath) => {
+    stats.hardcodedRaw++;
+    const notes = 'hardcoded HTTP auth/header secret';
+    const key = hardcodedDedupKey(service, password, notes);
+    const row = {
+      Owner: OWNER,
+      Service: service || 'webhook',
+      Account: '',
+      URL: looksLikeHttpUrl(password) ? password : '',
+      Username: '',
+      Email: looksLikeEmail(password) ? password : '',
+      Phone: looksLikePhone(password) ? password : '',
+      Password: password,
+      Miscellaneous: buildMisc({
+        nodeName,
+        nodeType,
+        workflowName,
+        filePath,
+        fieldPath,
+        credId: '',
+        duplicateCount: 1,
+      }),
+      Notes: notes,
+    };
+    mergeHardcodedRow(cleanAgg, key, row);
+  };
+
+  const pushReview = (reason, service, password, fieldPath) => {
+    reviewAgg.push({
+      Owner: OWNER,
+      Service: service || 'webhook',
+      Account: '',
+      URL: '',
+      Username: '',
+      Email: '',
+      Phone: '',
+      Password: password.slice(0, 200),
+      Miscellaneous: buildMisc({
+        nodeName,
+        nodeType,
+        workflowName,
+        filePath,
+        fieldPath,
+        credId: '',
+        duplicateCount: 1,
+      }),
+      Notes: 'hardcoded HTTP auth/header secret',
+      Reason: reason,
     });
+  };
+
+  for (const [k, v] of Object.entries(authentication)) {
+    if (typeof v !== 'string') continue;
+    const fp = `parameters.authentication.${k}`;
+    if (!isSecretKeyName(k) && !isHttpAuthHeaderName(k)) continue;
+    const c = classifyCandidate(v, k, fp, '');
+    if (c.ok) pushClean(k, c.value, fp);
+    else if (c.reason !== 'empty') pushReview(c.reason, k, v, fp);
+  }
+
+}
+
+/** --- Set node: named assignments only --- */
+function extractSetNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  const p = node.parameters || {};
+  const assigns = p.assignments?.assignments;
+  if (!Array.isArray(assigns)) return;
+  const nodeName = node.name || '';
+  const nodeType = node.type || '';
+
+  for (let i = 0; i < assigns.length; i++) {
+    const a = assigns[i];
+    const fieldName = a.name != null ? String(a.name) : '';
+    const val = a.value;
+    const fp = `parameters.assignments.assignments[${i}].value`;
+    if (!setAssignmentNameIndicatesSecret(fieldName)) {
+      if (
+        typeof val === 'string' &&
+        val.trim().length > 32 &&
+        !isN8nExpression(val) &&
+        !isUuid(val.trim())
+      ) {
+        reviewAgg.push({
+          Owner: OWNER,
+          Service: 'set',
+          Account: '',
+          URL: '',
+          Username: '',
+          Email: '',
+          Phone: '',
+          Password: val.slice(0, 200),
+          Miscellaneous: buildMisc({
+            nodeName,
+            nodeType,
+            workflowName,
+            filePath,
+            fieldPath: `${fp} (field name: ${fieldName})`,
+            credId: '',
+            duplicateCount: 1,
+          }),
+          Notes: 'explicit Set node secret',
+          Reason: 'low_confidence_set_node_value',
+        });
+      }
+      continue;
+    }
+    if (typeof val !== 'string') continue;
+    const c = classifyCandidate(val, fieldName, fp, '');
+    const notes = 'explicit Set node secret';
+    if (c.ok) {
+      stats.hardcodedRaw++;
+      const key = hardcodedDedupKey(fieldName, c.value, notes);
+      const row = {
+        Owner: OWNER,
+        Service: 'set',
+        Account: '',
+        URL: looksLikeHttpUrl(c.value) ? c.value : '',
+        Username: '',
+        Email: looksLikeEmail(c.value) ? c.value : '',
+        Phone: looksLikePhone(c.value) ? c.value : '',
+        Password: c.value,
+        Miscellaneous: buildMisc({
+          nodeName,
+          nodeType,
+          workflowName,
+          filePath,
+          fieldPath: `${fp} (field name: ${fieldName})`,
+          credId: '',
+          duplicateCount: 1,
+        }),
+        Notes: notes,
+      };
+      mergeHardcodedRow(cleanAgg, key, row);
+    } else if (c.reason !== 'empty') {
+      reviewAgg.push({
+        Owner: OWNER,
+        Service: 'set',
+        Account: '',
+        URL: '',
+        Username: '',
+        Email: '',
+        Phone: '',
+        Password: val.slice(0, 200),
+        Miscellaneous: buildMisc({
+          nodeName,
+          nodeType,
+          workflowName,
+          filePath,
+          fieldPath: `${fp} (field name: ${fieldName})`,
+          credId: '',
+          duplicateCount: 1,
+        }),
+        Notes: notes,
+        Reason: c.reason,
+      });
+    }
+  }
+}
+
+/** --- Code node: regex-only --- */
+function extractCodeNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  const code = node.parameters?.jsCode;
+  if (typeof code !== 'string' || !code.trim()) return;
+  const nodeName = node.name || '';
+  const nodeType = node.type || '';
+  const seen = new Set();
+
+  for (const { re, label } of CODE_SECRET_PATTERNS) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+      const cap = m[1];
+      if (!cap || seen.has(cap)) continue;
+      seen.add(cap);
+      const fp = `parameters.jsCode (pattern: ${label})`;
+      const c = classifyCandidate(cap, label, fp, '');
+      const notes = 'hardcoded password/token';
+      if (c.ok) {
+        stats.hardcodedRaw++;
+        const key = hardcodedDedupKey(`code:${label}`, c.value, notes);
+        const row = {
+          Owner: OWNER,
+          Service: 'code',
+          Account: '',
+          URL: looksLikeHttpUrl(c.value) ? c.value : '',
+          Username: '',
+          Email: looksLikeEmail(c.value) ? c.value : '',
+          Phone: looksLikePhone(c.value) ? c.value : '',
+          Password: c.value,
+          Miscellaneous: buildMisc({
+            nodeName,
+            nodeType,
+            workflowName,
+            filePath,
+            fieldPath: fp,
+            credId: '',
+            duplicateCount: 1,
+          }),
+          Notes: notes,
+        };
+        mergeHardcodedRow(cleanAgg, key, row);
+      } else if (c.reason !== 'empty') {
+        reviewAgg.push({
+          Owner: OWNER,
+          Service: 'code',
+          Account: '',
+          URL: '',
+          Username: '',
+          Email: '',
+          Phone: '',
+          Password: String(cap).slice(0, 200),
+          Miscellaneous: buildMisc({
+            nodeName,
+            nodeType,
+            workflowName,
+            filePath,
+            fieldPath: fp,
+            credId: '',
+            duplicateCount: 1,
+          }),
+          Notes: notes,
+          Reason: c.reason,
+        });
+      }
+    }
+  }
+}
+
+function mergeHardcodedRow(agg, key, row) {
+  if (!agg.has(key)) {
+    agg.set(key, { row: { ...row }, count: 1 });
+    return;
+  }
+  agg.get(key).count += 1;
+}
+
+function extractHttpLikeForNamedNode(node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  extractHttpRequestSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+}
+
+/** --- Loose broad walk (filtered) --- */
+function walkLooseParameters(obj, pathParts, node, workflowName, filePath, cleanAgg, reviewAgg, stats) {
+  if (obj === null || obj === undefined) return;
+  const tail = pathParts.join('.');
+  const pathStr = tail ? `parameters.${tail}` : 'parameters';
+
+  if (typeof obj === 'string') {
+    const lastKey = pathParts[pathParts.length - 1] || '';
+    if (isInternalConfigIdField(lastKey, pathStr)) {
+      return;
+    }
+    const c = classifyCandidate(obj, lastKey, pathStr, '');
+    if (c.ok && (isSecretKeyName(lastKey) || /^Bearer\s+/i.test(c.value))) {
+      stats.hardcodedRaw++;
+      const notes = 'hardcoded password/token';
+      const key = hardcodedDedupKey(`${lastKey}`, c.value, notes);
+      const row = {
+        Owner: OWNER,
+        Service: serviceFromNodeType(node.type),
+        Account: '',
+        URL: looksLikeHttpUrl(c.value) ? c.value : '',
+        Username: '',
+        Email: looksLikeEmail(c.value) ? c.value : '',
+        Phone: looksLikePhone(c.value) ? c.value : '',
+        Password: c.value,
+        Miscellaneous: buildMisc({
+          nodeName: node.name,
+          nodeType: node.type,
+          workflowName,
+          filePath,
+          fieldPath: pathStr,
+          credId: '',
+          duplicateCount: 1,
+        }),
+        Notes: notes,
+      };
+      mergeHardcodedRow(cleanAgg, key, row);
+    } else if (!c.ok && c.reason !== 'empty' && typeof obj === 'string' && obj.trim().length > 28) {
+      if (isSecretKeyName(lastKey) || /secret|token|password|auth/i.test(lastKey)) {
+        reviewAgg.push({
+          Owner: OWNER,
+          Service: serviceFromNodeType(node.type),
+          Account: '',
+          URL: '',
+          Username: '',
+          Email: '',
+          Phone: '',
+          Password: obj.slice(0, 200),
+          Miscellaneous: buildMisc({
+            nodeName: node.name,
+            nodeType: node.type,
+            workflowName,
+            filePath,
+            fieldPath: pathStr,
+            credId: '',
+            duplicateCount: 1,
+          }),
+          Notes: 'hardcoded password/token',
+          Reason: c.reason,
+        });
+      }
+    }
     return;
   }
 
@@ -402,26 +721,32 @@ function walkParametersForSecrets(
 
   if (Array.isArray(obj)) {
     obj.forEach((item, i) => {
-      walkParametersForSecrets(
-        item,
-        [...pathParts, `[${i}]`],
-        node,
-        workflowName,
-        filePath,
-        onFinding,
-        ctx,
-        null,
-      );
+      walkLooseParameters(item, [...pathParts, `[${i}]`], node, workflowName, filePath, cleanAgg, reviewAgg, stats);
     });
     return;
   }
 
   for (const [k, v] of Object.entries(obj)) {
-    walkParametersForSecrets(v, [...pathParts, k], node, workflowName, filePath, onFinding, ctx, obj);
+    if (k === 'jsCode' && node.type !== CODE_NODE) continue;
+    walkLooseParameters(v, [...pathParts, k], node, workflowName, filePath, cleanAgg, reviewAgg, stats);
   }
 }
 
-function processWorkflowFile(filePath, stats) {
+function serviceFromNodeType(nodeType) {
+  if (!nodeType || typeof nodeType !== 'string') return 'unknown';
+  const m = nodeType.match(/n8n-nodes-base\.(.+)/);
+  return m ? m[1] : nodeType;
+}
+
+function mergeCredentialRow(credAgg, key, row) {
+  if (!credAgg.has(key)) {
+    credAgg.set(key, { row: { ...row }, count: 1 });
+    return;
+  }
+  credAgg.get(key).count += 1;
+}
+
+function processWorkflowFile(filePath, mode, credAgg, cleanAgg, reviewAgg, stats) {
   let text;
   try {
     text = fs.readFileSync(filePath, 'utf8');
@@ -452,76 +777,108 @@ function processWorkflowFile(filePath, stats) {
 
   for (const node of payload.nodes || []) {
     if (!node || typeof node !== 'object') continue;
-    const nodeId = node.id || '';
-    const nodeName = node.name || '';
-    const nodeType = node.type || '';
 
     if (node.credentials && typeof node.credentials === 'object') {
       for (const [serviceKey, credObj] of Object.entries(node.credentials)) {
         if (!credObj || typeof credObj !== 'object') continue;
         const account = credObj.name != null ? String(credObj.name) : '';
         const credId = credObj.id != null ? String(credObj.id) : '';
+        stats.credentialRefsRaw++;
+        const key = credDedupKey(serviceKey, account, credId);
         const fieldPath = `credentials.${serviceKey}`;
-        const emailCol = looksLikeEmail(account) ? account : '';
-
-        stats.credentialRefs++;
-
-        stats.rows.push({
+        const row = {
           Owner: OWNER,
           Service: serviceKey,
           Account: account,
           URL: '',
           Username: '',
-          Email: emailCol,
+          Email: looksLikeEmail(account) ? account : '',
           Phone: '',
           Password: '',
-          Miscellaneous: buildMiscPieces({
-            nodeName,
-            nodeType,
+          Miscellaneous: buildMisc({
+            nodeName: node.name || '',
+            nodeType: node.type || '',
             workflowName,
             filePath,
             fieldPath,
             credId,
+            duplicateCount: 1,
           }),
           Notes: 'n8n credential reference',
-          _dedupAccount: account,
-          _dedupFieldPath: fieldPath,
-          _dedupPassword: '',
-          _dedupNodeId: nodeId,
-          _sourceFile: path.normalize(filePath),
-        });
+        };
+        mergeCredentialRow(credAgg, key, row);
       }
     }
 
-    if (node.parameters && typeof node.parameters === 'object') {
-      walkParametersForSecrets(
-        node.parameters,
-        [],
-        { name: nodeName, type: nodeType, id: nodeId },
-        workflowName,
-        filePath,
-        (row) => {
-          stats.hardcodedSecrets++;
-          const src = path.normalize(filePath);
-          stats.rows.push({
-            ...row,
-            _dedupFieldPath: row._fieldPath || row.Miscellaneous.match(/path=([^;]+)/)?.[1] || 'parameters',
-            _dedupPassword: row.Password,
-            _dedupNodeId: nodeId,
-            _dedupAccount: row._dedupAccount || '',
-            _sourceFile: src,
-          });
-        },
-        {},
-        null,
-      );
+    const t = node.type || '';
+
+    if (mode === 'strict') {
+      if (!isStrictHardcodedTarget(node)) {
+        continue;
+      }
+      if (t === HTTP_NODE) {
+        extractHttpRequestSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+      } else if (t === WEBHOOK_NODE) {
+        extractWebhookSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+      } else if (t === SET_NODE) {
+        extractSetNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+      } else if (t === CODE_NODE) {
+        extractCodeNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+      } else if (nodeNameSuggestsSecrets(node)) {
+        extractHttpLikeForNamedNode(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+      }
+      continue;
+    }
+
+    // loose mode
+    if (isBlockedBroadScanType(t)) {
+      continue;
+    }
+    if (t === HTTP_NODE) {
+      extractHttpRequestSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+    } else if (t === WEBHOOK_NODE) {
+      extractWebhookSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+    } else if (t === SET_NODE) {
+      extractSetNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+    } else if (t === CODE_NODE) {
+      extractCodeNodeSecrets(node, workflowName, filePath, cleanAgg, reviewAgg, stats);
+    }
+    const specialized = new Set([HTTP_NODE, WEBHOOK_NODE, SET_NODE, CODE_NODE]);
+    if (node.parameters && !specialized.has(t)) {
+      walkLooseParameters(node.parameters, [], node, workflowName, filePath, cleanAgg, reviewAgg, stats);
     }
   }
 }
 
+function finalizeCredRows(credAgg) {
+  const rows = [];
+  for (const { row, count } of credAgg.values()) {
+    let misc = row.Miscellaneous;
+    if (count > 1) {
+      misc = `${misc}; duplicate_count=${count}`;
+    }
+    rows.push({ ...row, Miscellaneous: misc });
+  }
+  return rows;
+}
+
+function finalizeHardcodedRows(cleanAgg) {
+  const rows = [];
+  for (const { row, count } of cleanAgg.values()) {
+    let misc = row.Miscellaneous;
+    if (count > 1) {
+      misc = `${misc}; duplicate_count=${count}`;
+    }
+    rows.push({ ...row, Miscellaneous: misc });
+  }
+  return rows;
+}
+
 function main() {
   const rawDir = process.env.N8N_WORKFLOWS_DIR;
-  const rawOut = process.env.OUTPUT_CSV || './n8n-credentials-export.csv';
+  const rawClean = process.env.OUTPUT_CSV || './n8n-credentials-clean.csv';
+  const rawReview = process.env.REVIEW_CSV || './n8n-credentials-review.csv';
+  const mode = normalizeMode();
 
   if (!rawDir || !String(rawDir).trim()) {
     console.error('Missing N8N_WORKFLOWS_DIR. Copy .env.example to .env and set N8N_WORKFLOWS_DIR.');
@@ -529,7 +886,8 @@ function main() {
   }
 
   const workflowsDir = path.resolve(process.cwd(), rawDir);
-  const outputCsv = path.resolve(process.cwd(), rawOut);
+  const outputClean = path.resolve(process.cwd(), rawClean);
+  const outputReview = path.resolve(process.cwd(), rawReview);
 
   if (!fs.existsSync(workflowsDir)) {
     console.error(`Workflow directory does not exist: ${workflowsDir}`);
@@ -539,6 +897,10 @@ function main() {
   const pattern = path.join(workflowsDir, '**/*.json').replace(/\\/g, '/');
   const files = fg.sync(pattern, { onlyFiles: true, absolute: true });
 
+  const credAgg = new Map();
+  const cleanAgg = new Map();
+  const reviewAgg = [];
+
   const stats = {
     filesScanned: files.length,
     filesParsed: 0,
@@ -546,63 +908,62 @@ function main() {
     filesFailedRead: 0,
     filesNotWorkflow: 0,
     workflowsParsed: 0,
-    credentialRefs: 0,
-    hardcodedSecrets: 0,
-    rows: [],
+    credentialRefsRaw: 0,
+    hardcodedRaw: 0,
   };
 
   for (const filePath of files) {
-    processWorkflowFile(filePath, stats);
+    processWorkflowFile(filePath, mode, credAgg, cleanAgg, reviewAgg, stats);
   }
 
-  const seen = new Set();
-  const uniqueRows = [];
-  for (const r of stats.rows) {
-    const fieldPath = r._dedupFieldPath || '';
-    const nodeId = r._dedupNodeId || '';
-    const wfName = (r.Miscellaneous.match(/workflow="([^"]*)"/) || [])[1] || '';
-    const pwd = r._dedupPassword !== undefined ? r._dedupPassword : r.Password;
-    const acct = r._dedupAccount !== undefined ? r._dedupAccount : r.Account;
-    const sourceFile = r._sourceFile || '';
+  const credRows = finalizeCredRows(credAgg);
+  const hardRows = finalizeHardcodedRows(cleanAgg);
 
-    const key = dedupKey(sourceFile, wfName, nodeId, fieldPath, pwd || '', acct || '');
+  const uniqueCredExported = credRows.length;
+  const hardcodedExported = hardRows.length;
+  const duplicatesRemoved =
+    stats.credentialRefsRaw -
+    uniqueCredExported +
+    (stats.hardcodedRaw - hardcodedExported);
 
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const {
-      _dedupFieldPath,
-      _dedupPassword,
-      _dedupNodeId,
-      _dedupAccount,
-      _sourceFile,
-      _fieldPath,
-      ...clean
-    } = r;
-    uniqueRows.push(clean);
+  for (const dir of [path.dirname(outputClean), path.dirname(outputReview)]) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 
-  const outDir = path.dirname(outputCsv);
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
-  }
+  fs.writeFileSync(
+    outputClean,
+    stringify([...credRows, ...hardRows], {
+      header: true,
+      columns: CSV_HEADERS,
+      quoted_string: true,
+    }),
+    'utf8',
+  );
 
-  const csvBody = stringify(uniqueRows, {
-    header: true,
-    columns: CSV_HEADERS,
-    quoted_string: true,
-  });
-
-  fs.writeFileSync(outputCsv, csvBody, 'utf8');
+  fs.writeFileSync(
+    outputReview,
+    stringify(reviewAgg, {
+      header: true,
+      columns: REVIEW_HEADERS,
+      quoted_string: true,
+    }),
+    'utf8',
+  );
 
   console.log('--- n8n credentials export summary ---');
-  console.log(`Files scanned:        ${stats.filesScanned}`);
-  console.log(`Workflows parsed:     ${stats.workflowsParsed}`);
-  console.log(`JSON parse failures:  ${stats.filesParseFailed}`);
-  console.log(`Non-workflow JSON:    ${stats.filesNotWorkflow}`);
-  console.log(`Credential refs:      ${stats.credentialRefs}`);
-  console.log(`Hardcoded detections: ${stats.hardcodedSecrets}`);
-  console.log(`Unique CSV rows:      ${uniqueRows.length}`);
-  console.log(`Output CSV:           ${outputCsv}`);
+  console.log(`EXTRACTION_MODE:       ${mode}`);
+  console.log(`JSON files scanned:    ${stats.filesScanned}`);
+  console.log(`Workflows parsed:      ${stats.workflowsParsed}`);
+  console.log(`JSON parse failures:   ${stats.filesParseFailed}`);
+  console.log(`Non-workflow JSON:     ${stats.filesNotWorkflow}`);
+  console.log(`Credential refs found: ${stats.credentialRefsRaw}`);
+  console.log(`Unique cred refs out:  ${uniqueCredExported}`);
+  console.log(`Hardcoded found:       ${stats.hardcodedRaw}`);
+  console.log(`Hardcoded exported:    ${hardcodedExported}`);
+  console.log(`Review rows written:   ${reviewAgg.length}`);
+  console.log(`Duplicates removed:    ${duplicatesRemoved}`);
+  console.log(`Clean CSV:             ${outputClean}`);
+  console.log(`Review CSV:            ${outputReview}`);
 }
 
 main();

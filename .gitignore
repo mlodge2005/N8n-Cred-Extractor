@@ -9,8 +9,9 @@ node_modules/
 .env.local
 .env.*.local
 
-# Tool output (often contains credential material)
+# All CSV files anywhere in this repo (clean/review exports; often sensitive)
 *.csv
+**/*.csv
 
 # Logs and debug
 npm-debug.log*

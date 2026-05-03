@@ -36,7 +36,7 @@ The end result is a **CSV file** (opens in Excel, Google Sheets, and similar app
 3. You run **one command** that installs dependencies the first time (`npm install`), and another command that runs the extractor (`npm run extract:n8n-creds`). The exact commands are in the project’s `README.md` and repeated in the footer below.
 4. The program walks through the folder you chose, opens each `.json` file, checks whether it looks like an n8n workflow, reads each node, and builds rows for the spreadsheet.
 5. When it finishes, it prints a **short summary** (counts only). It is written **not** to print your secret values on the screen, so you are less likely to accidentally expose them in a screenshot or screen share.
-6. You open the CSV file in your spreadsheet app to review the results.
+6. You open the **clean** CSV in your spreadsheet app for the main list, and optionally the **review** CSV if you want to double-check filtered rows.
 
 ---
 
@@ -113,7 +113,7 @@ A good AI answer should: confirm Node.js, guide you to clone or download the rep
 1. Inside the project folder, find the file named **`.env.example`**.  
 2. **Make a copy** of it and rename the copy to **`.env`** (exactly that name, starting with a dot).  
    - On Windows, if File Explorer complains about the name, you can create it in Notepad: save as `.env` with “All files” as the type, or ask an AI for the exact clicks for your Windows version.
-3. Open **`.env`** in a text editor. You should see two lines you can edit:
+3. Open **`.env`** in a text editor. You should see lines like:
 
    - **`N8N_WORKFLOWS_DIR=`**  
      Put the path to the folder that contains your **exported n8n workflow `.json` files** (and any subfolders you want included).  
@@ -121,7 +121,13 @@ A good AI answer should: confirm Node.js, guide you to clone or download the rep
      - Use the style of slashes your examples use: Windows often accepts `\` or `/` in paths inside `.env`.
 
    - **`OUTPUT_CSV=`**  
-     Put where you want the report file written. The default `./n8n-credentials-export.csv` means “in the project folder, next to `package.json`.” You can change the file name or subfolder if you like.
+     Path for the **high-confidence** report (`n8n-credentials-clean.csv` by default).
+
+   - **`REVIEW_CSV=`**  
+     Path for **borderline** detections you may want to check by hand (`n8n-credentials-review.csv` by default). That file has an extra **Reason** column explaining why something was not promoted to the clean file.
+
+   - **`EXTRACTION_MODE=`**  
+     Use **`strict`** (default) for only strong, node-aware matches, or **`loose`** for broader scanning with more noise.
 
 4. Save the file.
 
